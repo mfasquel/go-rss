@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"text/template"
 	"unicode"
 
 	"github.com/julienschmidt/httprouter"
@@ -34,20 +35,14 @@ type feed struct {
 }
 
 func (feed *feed) toRss() string {
-	var itemsRss string
-	for _, item := range feed.Items {
-		itemsRss += item.toRss()
+	tmpl, err := template.ParseFiles("feed.tmpl")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot parse template. %v", err)
+		return ""
 	}
-	// TODO : template
-	return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-		"<rss version=\"2.0\">" +
-		"<channel>" +
-		"<title>" + feed.MetaData.Title + "</title>" +
-		"<link>" + feed.MetaData.Link + "</link>" +
-		"<description>" + feed.MetaData.Description + "</description>" +
-		itemsRss +
-		"</channel>" +
-		"</rss>"
+	var buf bytes.Buffer
+	tmpl.Execute(&buf, feed)
+	return buf.String()
 }
 
 func (item *item) toRss() string {
@@ -174,6 +169,16 @@ func getFeed(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 		w.Header().Add("Content-Type", "application/json")
 		w.Write(feedJSON)
 	} else {
+		for i := range feed.Items {
+			desc, err := base64.StdEncoding.DecodeString(feed.Items[i].Description)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Cannot decode item description %v. %v", feed.Items[i].Description, err)
+				http.Error(w, fmt.Sprintf("Cannot load feed %v", feedName), http.StatusInternalServerError)
+				return
+			}
+			feed.Items[i].Description = string(desc)
+		}
+
 		w.Header().Add("Content-Type", "application/rss+xml")
 		fmt.Fprintf(w, feed.toRss())
 	}
@@ -187,16 +192,21 @@ func listFeeds(w http.ResponseWriter, r *http.Request, params httprouter.Params)
 		return
 	}
 
-	// TODO : reply all meta-data
-	var names []string
+	feedsMeta := make(map[string]feedMetaData)
 	for _, info := range infoList {
-		names = append(names, info.Name())
+		name := info.Name()
+		// TODO : this also get all items, new function with only meta ?
+		feed, _ := newFeedFromPath(basePath + "/" + name)
+		if feed != nil {
+			feedsMeta[name] = feed.MetaData
+		}
 	}
 
-	resp, err := json.Marshal(names)
+	resp, err := json.Marshal(feedsMeta)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to marshal feed names for base path %v. %v\n", basePath, err)
+		fmt.Fprintf(os.Stderr, "Cannot marshal feeds for base path %v. %v\n", basePath, err)
 		http.Error(w, "Cannot list feeds", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Add("Content-Type", "application/json")
@@ -296,7 +306,6 @@ func listItems(w http.ResponseWriter, r *http.Request, params httprouter.Params)
 		return
 	}
 
-	// TODO : reply all item data
 	items := make(map[string]item)
 	for _, info := range infoList {
 		name := info.Name()

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+<title>{{.MetaData.Title}}</title>
+<link>{{.MetaData.Link}}</link>
+<description>{{.MetaData.Description}}</description>
+{{range .Items}}
+<item>
+<title>{{.Title}}</title>
+<link>{{.Link}}</link>
+<description><![CDATA[{{.Description}}]]></description>
+</item>
+{{end}}
+</channel>
+</rss>
