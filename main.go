@@ -2,13 +2,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strings"
+	"unicode"
 
 	"github.com/julienschmidt/httprouter"
 )
@@ -19,7 +20,6 @@ type item struct {
 	Title       string
 	Link        string
 	Description string
-	Date        string
 }
 
 type feedMetaData struct {
@@ -34,15 +34,51 @@ type feed struct {
 }
 
 func (feed *feed) toRss() string {
-	// TODO : template + items
+	var itemsRss string
+	for _, item := range feed.Items {
+		itemsRss += item.toRss()
+	}
+	// TODO : template
 	return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
 		"<rss version=\"2.0\">" +
 		"<channel>" +
 		"<title>" + feed.MetaData.Title + "</title>" +
 		"<link>" + feed.MetaData.Link + "</link>" +
 		"<description>" + feed.MetaData.Description + "</description>" +
+		itemsRss +
 		"</channel>" +
 		"</rss>"
+}
+
+func (item *item) toRss() string {
+	desc, err := base64.StdEncoding.DecodeString(item.Description)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot decode item %v description", item.Title)
+		return ""
+	}
+	// TODO : template
+	return "<item>" +
+		"<title>" + item.Title + "</title>" +
+		"<link>" + item.Link + "</link>" +
+		"<description><![CDATA[" + string(desc) + "]]></description>" +
+		"</item>"
+}
+
+func newItemFromPath(path string) (*item, error) {
+	itemJSON, err := ioutil.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Item file cannot be read for %v. %v\n", path, err)
+		return nil, err
+	}
+
+	item := new(item)
+	err = json.Unmarshal(itemJSON, item)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Item cannot be unmarshalled for %v. %v\n", path, err)
+		return nil, err
+	}
+
+	return item, nil
 }
 
 func newFeedFromPath(path string) (*feed, error) {
@@ -66,12 +102,16 @@ func newFeedFromPath(path string) (*feed, error) {
 
 	for _, info := range infoList {
 		name := info.Name()
-		if !strings.HasSuffix(name, "meta.json") {
-			// TODO : items
+		if name != "meta.json" {
+			item, _ := newItemFromPath(path + "/" + name)
+			// TODO error handling / best effort ?
+			if item != nil {
+				feed.Items = append(feed.Items, *item)
+			}
 		}
 	}
 
-	return feed, err
+	return feed, nil
 }
 
 func createFeed(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
@@ -92,16 +132,15 @@ func createFeed(w http.ResponseWriter, r *http.Request, params httprouter.Params
 		return
 	}
 
-	// TODO : review permissions
-	err = os.Mkdir(feedPath, os.ModePerm)
+	err = os.Mkdir(feedPath, 0755)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot create feed %v. %v\n", feedPath, err)
+		fmt.Fprintf(os.Stderr, "Cannot create folder %v. %v\n", feedPath, err)
 		http.Error(w, fmt.Sprintf("Cannot create feed %v", feedName), http.StatusInternalServerError)
 		return
 	}
-	err = ioutil.WriteFile(feedPath+"/meta.json", buf.Bytes(), os.ModePerm)
+	err = ioutil.WriteFile(feedPath+"/meta.json", buf.Bytes(), 0644)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot create feed %v. %v\n", feedPath, err)
+		fmt.Fprintf(os.Stderr, "Cannot create file %v. %v\n", feedPath+"/meta.json", err)
 		http.Error(w, fmt.Sprintf("Cannot create feed %v", feedName), http.StatusInternalServerError)
 		return
 	}
@@ -118,21 +157,37 @@ func getFeed(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 
 	feed, err := newFeedFromPath(feedPath)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Feed object creation failed for path %v. %v\n", feedPath, err)
 		http.Error(w, fmt.Sprintf("Cannot load feed %v", feedName), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Add("Content-Type", "application/json")
-	fmt.Fprintf(w, feed.toRss())
+	acceptHeader := r.Header.Get("Accept")
+	if acceptHeader == "application/json" {
+		feedJSON, err := json.Marshal(feed)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Feed marshaling failed for path %v. %v\n", feedPath, err)
+			http.Error(w, fmt.Sprintf("Cannot load feed %v", feedName), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Add("Content-Type", "application/json")
+		w.Write(feedJSON)
+	} else {
+		w.Header().Add("Content-Type", "application/rss+xml")
+		fmt.Fprintf(w, feed.toRss())
+	}
 }
 
 func listFeeds(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	infoList, err := ioutil.ReadDir(basePath)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot read dir %v. %v\n", basePath, err)
 		http.Error(w, "Cannot list feeds", http.StatusInternalServerError)
 		return
 	}
 
+	// TODO : reply all meta-data
 	var names []string
 	for _, info := range infoList {
 		names = append(names, info.Name())
@@ -140,6 +195,7 @@ func listFeeds(w http.ResponseWriter, r *http.Request, params httprouter.Params)
 
 	resp, err := json.Marshal(names)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to marshal feed names for base path %v. %v\n", basePath, err)
 		http.Error(w, "Cannot list feeds", http.StatusInternalServerError)
 	}
 
@@ -148,12 +204,120 @@ func listFeeds(w http.ResponseWriter, r *http.Request, params httprouter.Params)
 }
 
 func createItem(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	feedName := params.ByName("feed")
+	feedPath := basePath + "/" + feedName
+	if _, err := os.Stat(feedPath); os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf("The feed %v does not exist", feedName), http.StatusBadRequest)
+		return
+	}
+
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(r.Body)
+	var item item
+	err := json.Unmarshal(buf.Bytes(), &item)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Cannot create item"), http.StatusBadRequest)
+		return
+	}
+
+	var sanitizedTitle string
+	for _, char := range item.Title {
+		if unicode.IsDigit(char) || unicode.IsLetter(char) {
+			sanitizedTitle += string(char)
+		}
+	}
+
+	itemPath := feedPath + "/" + sanitizedTitle
+	if _, err := os.Stat(itemPath); !os.IsNotExist(err) {
+		http.Error(w, "Item already exist", http.StatusBadRequest)
+		return
+	}
+
+	_, err = base64.StdEncoding.DecodeString(item.Description)
+	if err != nil {
+		http.Error(w, "Item description invalid", http.StatusBadRequest)
+		return
+	}
+
+	err = ioutil.WriteFile(itemPath, buf.Bytes(), 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create file %v. %v\n", itemPath, err)
+		http.Error(w, "Cannot create item", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
 }
 
 func getItem(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	feedName := params.ByName("feed")
+	feedPath := basePath + "/" + feedName
+	if _, err := os.Stat(feedPath); os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf("The feed %v does not exist", feedName), http.StatusBadRequest)
+		return
+	}
+
+	itemName := params.ByName("item")
+	itemPath := feedPath + "/" + itemName
+	if _, err := os.Stat(itemPath); os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf("The item %v does not exist", itemName), http.StatusBadRequest)
+		return
+	}
+
+	item, err := newItemFromPath(itemPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Item object creation failed for path %v. %v\n", itemPath, err)
+		http.Error(w, fmt.Sprintf("Cannot load item %v", itemName), http.StatusInternalServerError)
+		return
+	}
+
+	itemJSON, err := json.Marshal(item)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Item marshaling failed for path %v. %v\n", itemPath, err)
+		http.Error(w, fmt.Sprintf("Cannot load item %v", itemName), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.Write(itemJSON)
 }
 
 func listItems(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	feedName := params.ByName("feed")
+	feedPath := basePath + "/" + feedName
+	if _, err := os.Stat(feedPath); os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf("The feed %v does not exist", feedName), http.StatusBadRequest)
+		return
+	}
+
+	infoList, err := ioutil.ReadDir(feedPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot read dir %v. %v\n", feedPath, err)
+		http.Error(w, "Cannot list items", http.StatusInternalServerError)
+		return
+	}
+
+	// TODO : reply all item data
+	items := make(map[string]item)
+	for _, info := range infoList {
+		name := info.Name()
+		if name != "meta.json" {
+			item, _ := newItemFromPath(feedPath + "/" + name)
+			// TODO error handling / best effort ?
+			if item != nil {
+				items[name] = *item
+			}
+		}
+	}
+
+	resp, err := json.Marshal(items)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot marshal items for feed %v. %v\n", feedName, err)
+		http.Error(w, "Cannot list items", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.Write(resp)
 }
 
 func main() {
@@ -166,7 +330,7 @@ func main() {
 	router.GET("/feeds/:feed", getFeed)
 	router.POST("/feeds/:feed/items", createItem)
 	router.GET("/feeds/:feed/items", listItems)
-	router.POST("/feeds/:feed/items/:item", getItem)
+	router.GET("/feeds/:feed/items/:item", getItem)
 
 	log.Fatal(http.ListenAndServe(":8080", router))
 }
